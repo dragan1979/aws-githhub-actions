@@ -1,0 +1,103 @@
+name: 'Terraform Apply Deployment'
+
+# This pipeline runs only when code is merged into dev, staging, or main (push events)
+on:
+  push:
+    branches:
+      - dev
+      - staging
+      - main
+
+
+
+jobs:
+  terraform_apply:
+    name: Apply to ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: 'terraform-apply-${{ github.ref_name }}'
+      cancel-in-progress: true
+   
+
+
+    # 1. Environment and Permissions Setup
+    permissions:
+      contents: write    # Required for actions/checkout
+      id-token: write    # Required for aws-actions/configure-aws-credentials
+      issues: write      # Required for actions/github-script
+      pull-requests: write  # Required for posting the plan output as a comment
+     
+      # Add more permissions if needed (e.g., packages: write for Docker)
+    env:
+      # For 'apply' (push events), we use ref_name (the branch name)
+      TF_ENV_FOLDER: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform CLI
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.5
+
+      - name: Setup Python Dependencies
+        run: |
+          pip3 install python-terraform
+
+      # 2. Configure AWS Credentials via OIDC
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{secrets.AWS_ARN}}:role/GitHubActions-AWS-Admin
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Post Deployment Start Comment
+        uses: actions/github-script@v7
+        env:
+          
+          ENV_NAME: ${{ env.TF_ENV_FOLDER }}
+        with:
+          script: |
+            const startTime = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const environment = process.env.ENV_NAME.toUpperCase();
+            
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: `**Deployment Started for ${environment}**\n\n- Workflow: Apply Deployment\n- Environment: \`${environment}\`\n- Commit: \`${context.sha.substring(0, 7)}\`\n- Started At: ${startTime}\n- Status: Initializing Terraform...
+              [You can monitor the progress here.](https://github.com/${{github.repository}}/actions/runs/${{ github.run_id }})`
+            });
+
+       # 4. Run Terraform Apply
+      - name: Terraform Init and Apply
+        env:
+          TF_VAR_environment: ${{ env.TF_ENV_FOLDER }}
+        run: |
+            echo "Setting TF_VAR_environment to: $TF_VAR_environment"
+            # 1. Temporarily disable 'set -e' to capture the exit code reliably
+            set +e 
+            echo "::group::Full Terraform Workflow (Init, Plan, Apply)"
+            echo "::notice title=Deployment in Progress::Starting full workflow for environment ${{ env.TF_ENV_FOLDER }}..."
+            # 2. Execute Python wrapper and capture ALL output (including errors)
+            EXECUTION_OUTPUT=$(python3 tf_wrapper.py "environments/${{ env.TF_ENV_FOLDER }}")
+            PLAN_EXIT_CODE=$?
+            
+            # 3. Re-enable 'set -e' for the rest of the script
+            set -e 
+
+            # 4. Print output and handle errors
+            echo "Captured Exit Code: $PLAN_EXIT_CODE"
+            echo "--- Captured Terraform/Python Output ---"
+            echo "$EXECUTION_OUTPUT"
+            echo "--- End of Captured Output ---"
+            echo "::endgroup::"
+            # Check if the Python script returned exit code 1 (hard failure)
+            if [ $PLAN_EXIT_CODE -eq 1 ]; then
+                 echo "::error title=Terraform Apply Failed::The deployment failed due to a critical error (exit code 1)."
+                 exit 1
+            fi
+            # Exit code 0 means no changes, exit code 2 means changes applied. Both are successes for apply.
+            echo "Successfully applied infrastructure changes."
+                        

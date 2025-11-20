@@ -1,0 +1,168 @@
+name: 'Terraform Plan Validation'
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - dev
+      - staging
+      - main
+
+jobs:
+  terraform_plan_validation:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: 'terraform-plan-${{ github.head_ref }}'
+      cancel-in-progress: true
+    
+    # 1. Permissions for OIDC and PR Commenting
+    permissions:
+      contents: write   # Required for actions/checkout
+      id-token: write    # Required for aws-actions/configure-aws-credentials
+      pull-requests: write # Required for posting the plan output as a comment
+      
+    # 2. Environment Variable Setup
+    env:
+      # Determine environment folder based on the PR's target branch (base branch)
+     # "If the base branch is 'main', use 'prod'; otherwise, use the name of the base branch."
+     # github.base_ref refers to the target branch of the PR (e.g., 'dev', 'staging', 'main')
+      TF_ENV_FOLDER: ${{ github.base_ref == 'main' && 'prod' || github.base_ref }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform CLI
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.5
+      # Setup TFLint CLI
+      - name: Setup TFLint CLI
+        uses: terraform-linters/setup-tflint@v3 # Use the official setup action
+        with:
+          tflint_version: v0.50.0 
+
+      # 3. Configure AWS Credentials via OIDC
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::477568783935:role/GitHubActions-AWS-Admin
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # 4. Setup Python and Install Dependencies
+      - name: Setup Python Dependencies
+        run: |
+          pip3 install python-terraform
+
+      # 5. Run Terraform Plan (The main validation step)
+      - name: Run Terraform Plan and Capture Output (DEBUG)
+        id: plan
+        # We need to capture the environment variable for TF_ENV_FOLDER 
+        env:
+          TF_ENV_FOLDER: ${{ github.base_ref == 'main' && 'prod' || github.base_ref }}
+        run: |
+          # 1. Enable shell debugging (prints commands as they execute)
+          set -x
+          
+          echo "Running plan for environments/${{ env.TF_ENV_FOLDER }}..."
+          # 2. Execute Python wrapper and capture ALL output
+          PLAN_OUTPUT=$(python3 tf_wrapper.py environments/${{ env.TF_ENV_FOLDER }} --plan-only 2>&1)
+          PLAN_EXIT_CODE=$?
+          
+          echo "Captured Exit Code: $PLAN_EXIT_CODE"
+          
+          # 3. Print the full captured output immediately for debugging
+          echo "--- START OF PYTHON/TERRAFORM OUTPUT ---"
+          echo "${PLAN_OUTPUT}"
+          echo "--- END OF PYTHON/TERRAFORM OUTPUT ---"
+          
+          # 4. Save output to GITHUB_OUTPUT for the next step (commenting)
+          echo "PLAN_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+          echo "${PLAN_OUTPUT}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "PLAN_EXIT_CODE=$PLAN_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # 5. Fail the job only if the exit code is 1
+          if [ $PLAN_EXIT_CODE -eq 1 ]; then
+            echo "::error title=Terraform Plan Failed::The terraform plan failed with a hard configuration error."
+            exit 1
+          fi
+          
+      # 6. Post Plan Output as PR Comment
+      - name: Comment on Pull Request
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `${{ steps.plan.outputs.PLAN_OUTPUT }}`;
+            const exitCode = parseInt(`${{ steps.plan.outputs.PLAN_EXIT_CODE }}`);
+            const status = exitCode === 0 ? 'Success (No changes)' : (exitCode === 2 ? 'Success (Changes Detected)' : 'Failure');
+            
+            const commentBody = `
+            #### Terraform Plan Validation Summary
+            
+            **Target Environment:** \`${{ env.TF_ENV_FOLDER }}\`
+            **Status:** **${status}**
+            
+            <details><summary>Click to view full <code>terraform plan</code> output</summary>
+            [You can monitor the progress here.](https://github.com/${{github.repository}}/actions/runs/${{ github.run_id }})
+            
+            \`\`\`hcl
+            ${output}
+            \`\`\`
+            </details>
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+            
+      # 7. Run Static Code Analysis (TFLint & Checkov)
+      - name: Run Static Code Analysis (TFLint & Checkov)
+        id: static_analysis
+        run: |
+          set -x
+          pip3 install checkov
+          
+          # ... (TFLint Execution block) ...
+          
+          # --- Checkov Execution ---
+          echo "::group::Run Checkov Security Scan"
+          # 1. Add '2> /dev/null' to discard all standard error messages.
+          # 2. This ensures ONLY the clean JSON output goes into the file via '>'.
+          checkov -d . --framework terraform --soft-fail --output json 2> /dev/null > checkov_report.json
+          CHECK_EXIT_CODE=${PIPESTATUS[0]}
+          echo "Checkov Exit Code: ${CHECK_EXIT_CODE}"
+          echo "::endgroup::"
+           
+
+      - name: Upload Checkov Report Artifact
+        uses: actions/upload-artifact@v4
+        if: always() # Upload even if the checkov step failed, for debugging
+        with:
+          name: security-scan-report
+          path: checkov_report.json # Use the exact path saved in Step 1
+          retention-days: 7
+          
+      # --- NEW STEP: Convert JSON to HTML Report ---
+      - name: Install Jinja2 and Convert Checkov JSON to HTML
+        run: |
+          # Install Jinja2 for HTML templating in Python
+          pip3 install Jinja2
+          # Run the conversion script
+          python3 convert_json_to_html.py checkov_report.json checkov_report.html
+          
+  
+  
+      - name: Upload Checkov HTML Report Artifact
+        uses: actions/upload-artifact@v4
+        if: always() # Upload even if the checkov step failed, for debugging
+        with:
+          name: security-scan-html-report
+          path: checkov_report.html
+          retention-days: 7
