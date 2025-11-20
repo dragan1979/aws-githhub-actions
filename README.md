@@ -85,6 +85,6 @@ This pipeline is responsible for safely applying the infrastructure changes once
 
 1.  **Configure AWS IAM**: Set up the OIDC provider in AWS and create the IAM role `arn:aws:iam::12344555:role/GitHubActions-AWS-Admin` that trusts your GitHub repository's OIDC identity.
 2.  **Set Repository Variables**: Define the `AWS_REGION` variable in your GitHub Repository Settings.
-3.  **Create Environment Files**: Create your environment-specific configuration files (e.g., `environments/dev/variables.tfvars`).
+3.  **Create Environment Files**: Create your environment-specific configuration files (e.g., `environments/dev/variables.tf`).
 4.  **Open a Pull Request**: Submit code changes and check the PR comment for the `terraform plan` output.
 5.  **Merge**: Merge your PR to trigger the automated `terraform apply` deployment.
